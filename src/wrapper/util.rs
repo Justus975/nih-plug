@@ -118,6 +118,12 @@ pub fn setup_logger() {
     #[cfg(debug_assertions)]
     let logger_builder = logger_builder.always_show_module_path();
 
+    let logger_builder = logger_builder
+        .with_output_target(nih_log::OutputTarget::File(
+            r"C:\Users\justu\Desktop\nihlog.txt".into(),
+        ))
+        .unwrap();
+
     // In release builds there are some more logging messages from libraries that are not relevant
     // to the end user that can be filtered out
     #[cfg(not(debug_assertions))]

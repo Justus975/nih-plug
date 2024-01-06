@@ -1,3 +1,4 @@
+use log::logger;
 use std::borrow::Borrow;
 use std::ffi::c_void;
 use std::mem::{self, MaybeUninit};
@@ -5,7 +6,11 @@ use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use vst3_com::vst::{DataEvent, IProcessContextRequirementsFlags, ProcessModes};
+use vst3_com::vst::{
+    kChannelColorKey, kChannelIndexKey, kChannelIndexNamespaceKey, kChannelIndexNamespaceLengthKey,
+    kChannelIndexNamespaceOrderKey, kChannelNameKey, DataEvent, IAttributeList, IInfoListener,
+    IProcessContextRequirementsFlags, ProcessModes,
+};
 use vst3_sys::base::{kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tresult, TBool};
 use vst3_sys::base::{IBStream, IPluginBase};
 use vst3_sys::utils::SharedVstPtr;
@@ -45,7 +50,8 @@ use vst3_sys as vst3_com;
     IMidiMapping,
     INoteExpressionController,
     IProcessContextRequirements,
-    IUnitInfo
+    IUnitInfo,
+    IInfoListener
 ))]
 pub struct Wrapper<P: Vst3Plugin> {
     inner: Arc<WrapperInner<P>>,
@@ -1891,5 +1897,68 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
         _data: SharedVstPtr<dyn IBStream>,
     ) -> tresult {
         kInvalidArgument
+    }
+}
+
+impl<P: Vst3Plugin> IInfoListener for Wrapper<P> {
+    unsafe fn set_channel_context_infos(&self, list: *mut c_void) -> tresult {
+        //log
+        nih_log!("Channel context infos received");
+
+        if list.is_null() {
+            return kResultFalse;
+        }
+        let list: vst3_sys::VstPtr<dyn IAttributeList> =
+            vst3_sys::VstPtr::shared(list as *mut _).unwrap();
+
+        let mut utf16: [u16; 50] = [0; 50];
+        let utf_ptr: *mut TChar = utf16.as_mut_ptr() as *mut _;
+        if list.get_string(kChannelNameKey, utf_ptr, 50) == kResultOk {
+            let last_zero_index = utf16.iter().position(|&x| x == 0);
+            if let Some(index) = last_zero_index {
+                let utf16 = &utf16[..index]; // Slice utf16 up to the first zero
+                nih_log!("Channel name: {}", String::from_utf16_lossy(utf16));
+            }
+        }
+
+        let mut index: i64 = 0;
+        if list.get_int(kChannelIndexKey, &mut index) == kResultOk {
+            nih_log!("Channel index: {}", index);
+        }
+
+        let mut color: i64 = 0;
+        if list.get_int(kChannelColorKey, &mut color) == kResultOk {
+            let channel_color = color as u32;
+            let alpha = (channel_color >> 24) & 0xff;
+            let red = (channel_color >> 16) & 0xff;
+            let green = (channel_color >> 8) & 0xff;
+            let blue = channel_color & 0xff;
+            nih_log!(
+                "Channel color: {:02x}{:02x}{:02x}{:02x}",
+                red,
+                green,
+                blue,
+                alpha,
+            );
+        }
+
+        let mut namespace_order: i64 = 0;
+        if list.get_int(kChannelIndexNamespaceOrderKey, &mut namespace_order) == kResultOk {
+            nih_log!("Channel index namespace order: {}", namespace_order);
+        }
+
+        let mut namespace_length: i64 = 0;
+        if list.get_int(kChannelIndexNamespaceLengthKey, &mut namespace_length) == kResultOk {
+            nih_log!("Channel index namespace length: {}", namespace_length);
+        }
+
+        let mut namespace_name: [u16; 128] = [0; 128];
+        let namespace_name_ptr: *mut TChar = namespace_name.as_mut_ptr() as *mut _;
+        if list.get_string(kChannelIndexNamespaceKey, namespace_name_ptr, 128) == kResultOk {
+            let namespace_name = String::from_utf16_lossy(&namespace_name);
+            nih_log!("Channel index namespace: {}", namespace_name);
+        }
+
+        return kResultOk;
     }
 }
