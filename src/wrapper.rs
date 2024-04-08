@@ -11,4 +11,5 @@ pub mod standalone;
 pub mod vst3;
 
 // This is used by the wrappers.
+pub use util::hash_param_id;
 pub use util::setup_logger;

@@ -5,7 +5,31 @@ use std::any::Any;
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use crate::plugin::Daw;
 use crate::prelude::GuiContext;
+
+// pub struct EditorSpawn {
+//     pub on_key_down: Box<dyn Fn(vst3_sys::base::char16, i16, i16)>,
+//     pub on_key_up: Box<dyn Fn(vst3_sys::base::char16, i16, i16)>,
+//     pub handle: Box<dyn Any + Send>,
+// }
+
+pub trait EditorSpawned {
+    fn on_key_down(
+        &self,
+        key: vst3_sys::base::char16,
+        modifiers: i16,
+        key_code: i16,
+        // daw: Daw,
+    ) -> bool;
+    fn on_key_up(
+        &self,
+        key: vst3_sys::base::char16,
+        modifiers: i16,
+        key_code: i16,
+        // daw: Daw,
+    ) -> bool;
+}
 
 /// An editor for a [`Plugin`][crate::prelude::Plugin].
 pub trait Editor: Send {
@@ -37,8 +61,9 @@ pub trait Editor: Send {
     fn spawn(
         &self,
         parent: ParentWindowHandle,
+        daw: Daw,
         context: Arc<dyn GuiContext>,
-    ) -> Box<dyn Any + Send>;
+    ) -> Box<dyn EditorSpawned + Send>;
 
     /// Returns the (current) size of the editor in pixels as a `(width, height)` pair. This size
     /// must be reported in _logical pixels_, i.e. the size before being multiplied by the DPI

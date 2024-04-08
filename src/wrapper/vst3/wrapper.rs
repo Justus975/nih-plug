@@ -1,15 +1,21 @@
 use log::logger;
-use std::borrow::Borrow;
-use std::ffi::c_void;
+use std::borrow::{Borrow, BorrowMut};
+use std::ffi::{c_char, c_void, CString};
+use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::thread;
+use vst3_com::base::CStringA;
+use vst3_com::com_interface;
+use vst3_com::interfaces::IUnknown;
 use vst3_com::vst::{
     kChannelColorKey, kChannelIndexKey, kChannelIndexNamespaceKey, kChannelIndexNamespaceLengthKey,
-    kChannelIndexNamespaceOrderKey, kChannelNameKey, DataEvent, IAttributeList, IInfoListener,
-    IProcessContextRequirementsFlags, ProcessModes,
+    kChannelIndexNamespaceOrderKey, kChannelNameKey, DataEvent, IAttributeList, IComponentHandler,
+    IEditControllerHostEditing, IHostApplication, IInfoListener, IProcessContextRequirementsFlags,
+    ParamID, ProcessModes, RestartFlags,
 };
 use vst3_sys::base::{kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tresult, TBool};
 use vst3_sys::base::{IBStream, IPluginBase};
@@ -23,6 +29,7 @@ use vst3_sys::vst::{
 };
 use vst3_sys::VST3;
 use widestring::U16CStr;
+use windows::Win32::Foundation::FWP_E_NULL_DISPLAY_NAME;
 
 use super::inner::{ProcessEvent, WrapperInner};
 use super::note_expressions::{self, NoteExpressionController};
@@ -31,12 +38,12 @@ use super::util::{
 };
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
 use super::view::WrapperView;
+use crate::plugin::{Daw, MyNihExtention, ParamEditingHandler};
 use crate::prelude::{
-    AuxiliaryBuffers, BufferConfig, MidiConfig, NoteEvent, ParamFlags, ProcessMode, ProcessStatus,
-    SysExMessage, Transport, Vst3Plugin,
+    AuxiliaryBuffers, BufferConfig, MidiConfig, NoteEvent, ParamFlags, Plugin, ProcessMode,
+    ProcessStatus, SysExMessage, Transport, Vst3Plugin,
 };
 use crate::util::permit_alloc;
-use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{clamp_input_event_timing, clamp_output_event_timing, process_wrapper};
 
@@ -46,6 +53,7 @@ use vst3_sys as vst3_com;
 #[VST3(implements(
     IComponent,
     IEditController,
+    // IEditControllerHostEditing,
     IAudioProcessor,
     IMidiMapping,
     INoteExpressionController,
@@ -55,11 +63,14 @@ use vst3_sys as vst3_com;
 ))]
 pub struct Wrapper<P: Vst3Plugin> {
     inner: Arc<WrapperInner<P>>,
+    ext: <P as Plugin>::MyNihExtention,
 }
 
 impl<P: Vst3Plugin> Wrapper<P> {
     pub fn new() -> Box<Self> {
-        Self::allocate(WrapperInner::new())
+        let inner = WrapperInner::<P>::new();
+        let ext = inner.plugin.lock().get_my_nih_extention();
+        Self::allocate(inner, ext)
     }
 }
 
@@ -69,9 +80,77 @@ impl<P: Vst3Plugin> Drop for Wrapper<P> {
     }
 }
 
+#[com_interface("79655E36-77EE-4267-A573-FEF74912C27C")]
+pub trait IReaperHostApplication: IUnknown {
+    unsafe fn get_reaper_api(&self, funcname: CStringA) -> *mut c_void;
+    unsafe fn get_reaper_parent(&self, w: u32) -> *mut c_void;
+    unsafe fn reaper_extended(
+        &self,
+        call: u32,
+        parm1: *mut c_void,
+        parm2: *mut c_void,
+        parm3: *mut c_void,
+    ) -> *mut c_void;
+}
+
 impl<P: Vst3Plugin> IPluginBase for Wrapper<P> {
-    unsafe fn initialize(&self, _context: *mut c_void) -> tresult {
+    unsafe fn initialize(&self, context: *mut c_void) -> tresult {
         // We currently don't need or allow any initialization logic
+        // let reaper: SharedVstPtr<dyn IReaperHostApplication> = SharedVstPtr::null();
+        //
+        let host: Option<vst3_sys::VstPtr<dyn IUnknown>> =
+            vst3_sys::VstPtr::shared(context as *mut _);
+        if let Some(host) = host.and_then(|r| r.cast::<dyn IHostApplication>()) {
+            let mut utf16: [u16; 50] = [0; 50];
+            let utf_ptr: *mut u16 = utf16.as_mut_ptr() as *mut _;
+
+            host.get_name(utf_ptr);
+
+            let last_zero_index = utf16.iter().position(|&x| x == 0);
+            if let Some(index) = last_zero_index {
+                let utf16 = &utf16[..index]; // Slice utf16 up to the first zero
+                let host_name = String::from_utf16_lossy(utf16);
+
+                let daw = if host_name == "REAPER" {
+                    Daw::Reaper
+                } else {
+                    Daw::Other
+                };
+
+                self.inner.daw.store(daw);
+
+                // self.ext.on_daw(daw);
+            }
+        }
+
+        /*
+
+        /// This is the access to the reaper api. could be used to fix the parameter issue in reaper.
+        /// perhaps with a pseudo parameter to identify the right plugin instance
+
+        let reaper: Option<vst3_sys::VstPtr<dyn IUnknown>> =
+        vst3_sys::VstPtr::shared(context as *mut _);
+        if let Some(reaper) = reaper.and_then(|r| r.cast::<dyn IReaperHostApplication>()) {
+            nih_log!("Got reaper host application");
+            let cstr = &CString::new("ShowConsoleMsg").unwrap();
+            let fn_name: CStringA = cstr.as_ptr() as *const _;
+            let fn_ptr = reaper.get_reaper_api(fn_name);
+
+            if fn_ptr.is_null() {
+                nih_log!("Could not get ShowConsoleMsg");
+                return kResultOk;
+            } else {
+                nih_log!("Got ShowConsoleMsg");
+            }
+
+            type ShowConsoleMsg = extern "C" fn(msg: *const c_char);
+
+            let fn_ptr = reaper.get_reaper_api(fn_name);
+            let show_console_msg: ShowConsoleMsg = unsafe { std::mem::transmute(fn_ptr) };
+            let cstr = &CString::new("Hello from Rust").unwrap();
+            show_console_msg(cstr.as_ptr());
+        }*/
+
         kResultOk
     }
 
@@ -455,16 +534,9 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
             return kResultFalse;
         }
 
-        match state::deserialize_json(&read_buffer) {
-            Some(mut state) => {
-                if self.inner.set_state_inner(&mut state) {
-                    nih_trace!("Loaded state ({} bytes)", read_buffer.len());
-                    kResultOk
-                } else {
-                    kResultFalse
-                }
-            }
-            None => kResultFalse,
+        match self.ext.set_state(&read_buffer) {
+            Ok(()) => kResultOk,
+            Err(_) => kResultFalse,
         }
     }
 
@@ -473,12 +545,13 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
 
         let state = state.upgrade().unwrap();
 
-        let serialized = state::serialize_json::<P>(
+        /* let serialized = state::serialize_json::<P>(
             self.inner.params.clone(),
             state::make_params_iter(&self.inner.param_by_hash, &self.inner.param_id_to_hash),
-        );
+        ); */
+        let serialized = self.ext.get_state();
         match serialized {
-            Ok(serialized) => {
+            Some(serialized) => {
                 let mut num_bytes_written = 0;
                 let result = state.write(
                     serialized.as_ptr() as *const c_void,
@@ -493,14 +566,25 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
 
                 kResultOk
             }
-            Err(err) => {
-                nih_debug_assert_failure!("Could not save state: {:#}", err);
+            None => {
+                nih_debug_assert_failure!("Could not save state: ");
                 kResultFalse
             }
         }
     }
 }
 
+/* impl<P: Vst3Plugin> IEditControllerHostEditing for Wrapper<P> {
+    unsafe fn begin_edit_from_host(&self, id: ParamID) -> tresult {
+        return kResultOk;
+        // todo!()
+    }
+
+    unsafe fn end_edit_from_host(&self, id: ParamID) -> tresult {
+        return kResultOk;
+        // todo!()
+    }
+} */
 impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     unsafe fn set_component_state(&self, _state: SharedVstPtr<dyn IBStream>) -> tresult {
         // We have a single file component, so we don't need to do anything here
@@ -604,23 +688,8 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
         value_normalized: f64,
         string: *mut TChar,
     ) -> tresult {
-        check_null_ptr!(string);
-
-        let dest = &mut *(string as *mut [TChar; 128]);
-
-        // TODO: We don't implement these methods at all for our generated MIDI CC parameters,
-        //       should be fine right? They should be hidden anyways.
-        match self.inner.param_by_hash.get(&id) {
-            Some(param_ptr) => {
-                u16strlcpy(
-                    dest,
-                    &param_ptr.normalized_value_to_string(value_normalized as f32, false),
-                );
-
-                kResultOk
-            }
-            _ => kInvalidArgument,
-        }
+        self.ext
+            .get_param_string_by_value(id, value_normalized, string)
     }
 
     unsafe fn get_param_value_by_string(
@@ -629,62 +698,44 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
         string: *const TChar,
         value_normalized: *mut f64,
     ) -> tresult {
-        check_null_ptr!(string, value_normalized);
-
-        let string = match U16CStr::from_ptr_str(string as *const u16).to_string() {
-            Ok(s) => s,
-            Err(_) => return kInvalidArgument,
-        };
-
-        match self.inner.param_by_hash.get(&id) {
-            Some(param_ptr) => {
-                let value = match param_ptr.string_to_normalized_value(&string) {
-                    Some(v) => v as f64,
-                    None => return kResultFalse,
-                };
-                *value_normalized = value;
-
-                kResultOk
-            }
-            _ => kInvalidArgument,
-        }
+        self.ext
+            .get_param_value_by_string(id, string, value_normalized)
     }
 
     unsafe fn normalized_param_to_plain(&self, id: u32, value_normalized: f64) -> f64 {
-        match self.inner.param_by_hash.get(&id) {
-            Some(param_ptr) => param_ptr.preview_plain(value_normalized as f32) as f64,
-            _ => value_normalized,
-        }
+        self.ext.normalized_param_to_plain(id, value_normalized)
     }
 
     unsafe fn plain_param_to_normalized(&self, id: u32, plain_value: f64) -> f64 {
-        match self.inner.param_by_hash.get(&id) {
-            Some(param_ptr) => param_ptr.preview_normalized(plain_value as f32) as f64,
-            _ => plain_value,
-        }
+        self.ext.plain_param_to_normalized(id, plain_value)
     }
 
     unsafe fn get_param_normalized(&self, id: u32) -> f64 {
-        match self.inner.param_by_hash.get(&id) {
-            Some(param_ptr) => param_ptr.modulated_normalized_value() as f64,
-            _ => 0.5,
-        }
+        self.ext.get_param_normalized(id)
     }
 
     unsafe fn set_param_normalized(&self, id: u32, value: f64) -> tresult {
+        // return kResultOk;
         // If the plugin is currently processing audio, then this parameter change will also be sent
         // to the process function
-        if self.inner.is_processing.load(Ordering::SeqCst) {
-            return kResultOk;
-        }
 
-        let sample_rate = self
+        //ICH
+        /*if self.inner.is_processing.load(Ordering::SeqCst) {
+            return kResultOk;
+        } */
+
+        // Wie funktionieren Parameter?
+        // ich habe meine eq events die modifien den eq und die parameter changes werden dann über die outputParameterChanges an den host geschickt
+        // self.ext.on_host_param_change(id, value as f32);
+        self.ext.set_param_normalized(id, value)
+
+        /* let sample_rate = self
             .inner
             .current_buffer_config
             .load()
             .map(|c| c.sample_rate);
         self.inner
-            .set_normalized_value_by_hash(id, value as f32, sample_rate)
+            .set_normalized_value_by_hash(id, value as f32, sample_rate) */
     }
 
     unsafe fn set_component_handler(
@@ -693,15 +744,62 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     ) -> tresult {
         *self.inner.component_handler.borrow_mut() = handler.upgrade().map(VstPtr::from);
 
+        /* let first_p = self.inner.param_hashes.first().unwrap().clone();
+
+               let send_handler = SendWrapper(handler.as_ptr());
+
+               let inner = self.inner.clone();
+        */
+        /* let set_p = move |val: f32| {
+            // let send_handler = send_handler.0.;
+            let send_handler = *send_handler.get();
+            let inner = inner.clone();
+            // let send_handler = send_handler.clone();
+            let send_handler = SendWrapper(send_handler);
+            thread::spawn(move || {
+                let h = send_handler.get();
+                let h: vst3_sys::VstPtr<dyn IComponentHandler> =
+                    vst3_sys::VstPtr::shared(*h).unwrap();
+                /*  let handler: SharedVstPtr<dyn vst3_sys::vst::IComponentHandler> =
+                 *handler as *mut _; */
+                // let h = handler.upgrade().unwrap();
+                // let h = h.unwrap();
+
+                // Reaper requiers to perform_edit and set_normalized_value_by_hash, because it usally only writes automaion if the gui is open
+                //This is a little bit hacky, but it works
+                h.begin_edit(first_p);
+                h.perform_edit(first_p, val as f64);
+
+                //Wichtig
+                inner.set_normalized_value_by_hash(first_p, val, Some(44100.0));
+
+                h.end_edit(first_p);
+                // h.restart_component(RestartFlags::kParamValuesChanged as i32);
+                // Begin Edit
+            });
+        };
+
+        self.inner.plugin.lock().set_param_begin_edit(set_p); */
+
+        let Some(component_handler) = handler.upgrade() else {
+            return kResultOk;
+        };
+        let handler = ParamEditingHandler::new(component_handler);
+
+        self.ext.set_param_edit_handler(handler);
+
         kResultOk
     }
 
     unsafe fn create_view(&self, _name: vst3_sys::base::FIDString) -> *mut c_void {
         // Without specialization this is the least redundant way to check if the plugin has an
         // editor. The default implementation returns a None here.
+        let daw = self.inner.daw.load();
         match self.inner.editor.borrow().as_ref() {
-            Some(editor) => Box::into_raw(WrapperView::new(self.inner.clone(), editor.clone()))
-                as *mut vst3_sys::c_void,
+            Some(editor) => {
+                Box::into_raw(WrapperView::new(self.inner.clone(), editor.clone(), daw))
+                    as *mut vst3_sys::c_void
+            }
             None => std::ptr::null_mut(),
         }
     }
@@ -939,6 +1037,51 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
     unsafe fn process(&self, data: *mut vst3_sys::vst::ProcessData) -> tresult {
         check_null_ptr!(data);
 
+        /* let mut plugin = permit_alloc(|| self.inner.plugin.lock());
+
+        if let Some((_id, value)) = plugin.recv_param_change() {
+            let id = self.inner.param_hashes.first().unwrap();
+            // let bla = self.inner.param_by_hash.get(id).unwrap();
+            // self.inner.par
+            // nih_log!("id param {}", self.inner.param_id_by_hash.get(id).unwrap());
+            // let id = self.inner.
+            {
+                let y: u32 = 1;
+                let i: *const u32 = id;
+                let mut index: i32 = 0;
+                let index_ptr: *mut i32 = &mut index;
+                // if let Some((_, p)) = self.inner.params.param_map().first() {
+                let b = (&*data)
+                    .output_param_changes
+                    .upgrade()
+                    .unwrap()
+                    .add_parameter_data(i, index_ptr);
+
+                b.upgrade().unwrap().add_point(0, value as f64, index_ptr);
+            }
+        }
+
+        drop(plugin); */
+
+        //let (_, first_param, _) = self.inner.params.param_map().first().unwrap();
+        // let id = self.inner.param_id_to_hash.get("Gain").unwrap();
+
+        // return kResultOk;
+        /* {
+            let i: u32 = 1;
+            let i: *const u32 = &i;
+            let mut index: i32 = 0;
+            let index: *mut i32 = &mut index;
+            // if let Some((_, p)) = self.inner.params.param_map().first() {
+            let b = (&*data)
+                .input_param_changes
+                .upgrade()
+                .unwrap()
+                .add_parameter_data(i, index);
+
+            b.upgrade().unwrap().add_point(0, 0.8, index);
+        } */
+
         // Panic on allocations if the `assert_process_allocs` feature has been enabled, and make
         // sure that FTZ is set up correctly
         process_wrapper(|| {
@@ -989,9 +1132,30 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
 
             // First we'll go through the parameter changes. This may also include MIDI CC messages
             // if the plugin supports those
+
+            /* let mut plugin = self.inner.plugin.lock();
+            while let Some((id, value)) = self.ext.receive_param_change_in_process_fn() {
+                self.inner
+                    .set_normalized_value_by_hash(id, value, Some(sample_rate));
+                plugin.on_process_param_change(id, value);
+            }
+            drop(plugin); */
+
             if let Some(param_changes) = data.input_param_changes.upgrade() {
+                //let raw_vst_ptr = &(&*data).input_param_changes.upgrade().unwrap();
+                /* let mut index: i32 = 0;
+                let data = param_changes.add_parameter_data(&id as *const _, index as *mut _);
+                while let Some((id, value)) = self.ext.receive_param_change_in_process_fn() {
+                    data.upgrade()
+                        .unwrap()
+                        .add_point(0, value as f64, &mut index);
+                } */
+
                 let num_param_queues = param_changes.get_parameter_count();
+
                 for change_queue_idx in 0..num_param_queues {
+                    //achtung """"""""
+                    // continue;
                     if let Some(param_change_queue) =
                         param_changes.get_parameter_data(change_queue_idx).upgrade()
                     {
@@ -1058,11 +1222,18 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                                         normalized_value: value,
                                     });
                                 } else {
-                                    self.inner.set_normalized_value_by_hash(
+                                    //Frist set the parameters
+                                    /*  self.inner.set_normalized_value_by_hash(
                                         param_hash,
                                         value,
                                         Some(sample_rate),
-                                    );
+                                    ); */
+                                    self.inner
+                                        .plugin
+                                        .lock()
+                                        .on_process_param_change(param_hash, value);
+                                    //Then apply them to the eq
+                                    // self.ext.on_host_param_change(param_hash, value);
                                 }
                             }
                         }
@@ -1208,11 +1379,14 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                                     break;
                                 }
 
-                                self.inner.set_normalized_value_by_hash(
-                                    *hash,
-                                    *normalized_value,
+                                let hash = *hash;
+                                let normalized_value = *normalized_value;
+
+                                /* self.inner.set_normalized_value_by_hash(
+                                    hash,
+                                    normalized_value,
                                     Some(sample_rate),
-                                );
+                                ); */
                             }
                             ProcessEvent::NoteEvent(event) => {
                                 // We need to make sure to compensate the event for any block splitting,
@@ -1399,6 +1573,29 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                         // NOTE: `parking_lot`'s mutexes sometimes allocate because of their use of
                         //       thread locals
                         let mut plugin = permit_alloc(|| self.inner.plugin.lock());
+
+                        /* if let Some((_id, value)) = plugin.recv_param_change() {
+                            let id = self.inner.param_hashes.first().unwrap();
+                            // let bla = self.inner.param_by_hash.get(id).unwrap();
+                            // self.inner.par
+                            // nih_log!("id param {}", self.inner.param_id_by_hash.get(id).unwrap());
+                            // let id = self.inner.
+                            {
+                                let y: u32 = 1;
+                                let i: *const u32 = id;
+                                let mut index: i32 = 0;
+                                let index_ptr: *mut i32 = &mut index;
+                                // if let Some((_, p)) = self.inner.params.param_map().first() {
+                                let b = (&*data)
+                                    .output_param_changes
+                                    .upgrade()
+                                    .unwrap()
+                                    .add_parameter_data(i, index_ptr);
+
+                                b.upgrade().unwrap().add_point(0, value as f64, index_ptr);
+                            }
+                        } */
+
                         let mut aux = AuxiliaryBuffers {
                             inputs: buffers.aux_inputs,
                             outputs: buffers.aux_outputs,
@@ -1917,13 +2114,16 @@ impl<P: Vst3Plugin> IInfoListener for Wrapper<P> {
             let last_zero_index = utf16.iter().position(|&x| x == 0);
             if let Some(index) = last_zero_index {
                 let utf16 = &utf16[..index]; // Slice utf16 up to the first zero
-                nih_log!("Channel name: {}", String::from_utf16_lossy(utf16));
+                let track_name = String::from_utf16_lossy(utf16);
+                nih_log!("Channel name: {}", track_name);
+                self.ext.on_track_name(track_name)
             }
         }
 
         let mut index: i64 = 0;
         if list.get_int(kChannelIndexKey, &mut index) == kResultOk {
             nih_log!("Channel index: {}", index);
+            self.ext.on_track_index(index as u32);
         }
 
         let mut color: i64 = 0;
@@ -1940,9 +2140,11 @@ impl<P: Vst3Plugin> IInfoListener for Wrapper<P> {
                 blue,
                 alpha,
             );
+            self.ext
+                .on_track_color(red as u8, green as u8, blue as u8, alpha as u8);
         }
 
-        let mut namespace_order: i64 = 0;
+        /* let mut namespace_order: i64 = 0;
         if list.get_int(kChannelIndexNamespaceOrderKey, &mut namespace_order) == kResultOk {
             nih_log!("Channel index namespace order: {}", namespace_order);
         }
@@ -1950,15 +2152,52 @@ impl<P: Vst3Plugin> IInfoListener for Wrapper<P> {
         let mut namespace_length: i64 = 0;
         if list.get_int(kChannelIndexNamespaceLengthKey, &mut namespace_length) == kResultOk {
             nih_log!("Channel index namespace length: {}", namespace_length);
-        }
+        } */
 
-        let mut namespace_name: [u16; 128] = [0; 128];
+        // TODO: Try to get the namespace name
+
+        /* let mut namespace_name: [u16; 128] = [0; 128];
         let namespace_name_ptr: *mut TChar = namespace_name.as_mut_ptr() as *mut _;
         if list.get_string(kChannelIndexNamespaceKey, namespace_name_ptr, 128) == kResultOk {
             let namespace_name = String::from_utf16_lossy(&namespace_name);
             nih_log!("Channel index namespace: {}", namespace_name);
-        }
+        } */
 
         return kResultOk;
     }
 }
+
+struct SendWrapper<T>(T);
+
+unsafe impl<T> Send for SendWrapper<T> {}
+unsafe impl<T> Sync for SendWrapper<T> {}
+
+impl<T> SendWrapper<T> {
+    fn get(&self) -> &T {
+        &self.0
+    }
+}
+
+// Parameter workfolow:
+// Gui and Host can change parameters
+// Host can change parameters while processing ( = automation) and does also call setParameterNormalized (edit controler)
+// Host should create HostEvents
+// And gui should create GuiEvents
+// Frequency change example:
+// Host changes frequency in process call => Monitor parametermovement in the Gui
+//    is this a cmd for the aggreate?
+//    or just change the value?
+//    yes trigger events, because of the subscriptions in the guihandlers
+//    but do not save them in the event store
+//
+// Gui changes frequency
+//    freq events
+//    done in a servie ->
+//      beginEdit
+//      performEdit
+//      endEdit
+
+// Host changes frequency
+//     in Plugin trait on_parameter_changed_by_host fn
+
+// Sidenode: You could also utilze outputParameterChanges to write automation data to the host in Reaper

@@ -80,8 +80,10 @@ use std::time::Duration;
 use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContext};
 use super::descriptor::PluginDescriptor;
 use super::util::ClapPtr;
+use crate::editor::EditorSpawned;
 use crate::event_loop::{BackgroundThread, EventLoop, MainThreadExecutor, TASK_QUEUE_CAPACITY};
 use crate::midi::MidiResult;
+use crate::plugin::Daw;
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, BufferConfig, ClapPlugin, Editor, MidiConfig,
     NoteEvent, ParamFlags, ParamPtr, Params, ParentWindowHandle, Plugin, PluginNoteEvent,
@@ -118,7 +120,7 @@ pub struct Wrapper<P: ClapPlugin> {
     editor: AtomicRefCell<Option<Mutex<Box<dyn Editor>>>>,
     /// A handle for the currently active editor instance. The plugin should implement `Drop` on
     /// this handle for its closing behavior.
-    editor_handle: Mutex<Option<Box<dyn Any + Send>>>,
+    editor_handle: Mutex<Option<Box<dyn EditorSpawned + Send>>>,
     /// The DPI scaling factor as passed to the [IPlugViewContentScaleSupport::set_scale_factor()]
     /// function. Defaults to 1.0, and will be kept there on macOS. When reporting and handling size
     /// the sizes communicated to and from the DAW should be scaled by this factor since NIH-plug's
@@ -2780,15 +2782,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                 };
 
                 // This extension is only exposed when we have an editor
-                *editor_handle = Some(
-                    wrapper
-                        .editor
-                        .borrow()
-                        .as_ref()
-                        .unwrap()
-                        .lock()
-                        .spawn(parent_handle, wrapper.clone().make_gui_context()),
+                let handle = wrapper.editor.borrow().as_ref().unwrap().lock().spawn(
+                    parent_handle,
+                    Daw::Other,
+                    wrapper.clone().make_gui_context(),
                 );
+                *editor_handle = Some(handle);
 
                 true
             } else {

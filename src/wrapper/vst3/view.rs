@@ -5,6 +5,7 @@ use std::ffi::{c_void, CStr};
 use std::mem;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use vst3_com::base::kResultTrue;
 use vst3_sys::base::{kInvalidArgument, kResultFalse, kResultOk, tresult, TBool};
 use vst3_sys::gui::{IPlugFrame, IPlugView, IPlugViewContentScaleSupport, ViewRect};
 use vst3_sys::utils::SharedVstPtr;
@@ -12,7 +13,9 @@ use vst3_sys::VST3;
 
 use super::inner::{Task, WrapperInner};
 use super::util::{ObjectPtr, VstPtr};
+use crate::editor::EditorSpawned;
 use crate::plugin::vst3::Vst3Plugin;
+use crate::plugin::Daw;
 use crate::prelude::{Editor, ParentWindowHandle};
 
 // Alias needed for the VST3 attribute macro
@@ -51,9 +54,10 @@ struct RunLoopEventHandlerWrapper<P: Vst3Plugin>(std::marker::PhantomData<P>);
 /// editor. This is managed separately so the lifetime bounds match up.
 #[VST3(implements(IPlugView, IPlugViewContentScaleSupport))]
 pub(crate) struct WrapperView<P: Vst3Plugin> {
+    daw: Daw,
     inner: Arc<WrapperInner<P>>,
     editor: Arc<Mutex<Box<dyn Editor>>>,
-    editor_handle: RwLock<Option<Box<dyn Any>>>,
+    editor_handle: RwLock<Option<Box<dyn EditorSpawned>>>,
 
     /// The `IPlugFrame` instance passed by the host during [IPlugView::set_frame()].
     plug_frame: RwLock<Option<VstPtr<dyn IPlugFrame>>>,
@@ -99,8 +103,13 @@ struct RunLoopEventHandler<P: Vst3Plugin> {
 }
 
 impl<P: Vst3Plugin> WrapperView<P> {
-    pub fn new(inner: Arc<WrapperInner<P>>, editor: Arc<Mutex<Box<dyn Editor>>>) -> Box<Self> {
+    pub fn new(
+        inner: Arc<WrapperInner<P>>,
+        editor: Arc<Mutex<Box<dyn Editor>>>,
+        daw: Daw,
+    ) -> Box<Self> {
         Self::allocate(
+            daw,
             inner,
             editor,
             RwLock::new(None),
@@ -303,11 +312,12 @@ impl<P: Vst3Plugin> IPlugView for WrapperView<P> {
                 }
             };
 
-            *editor_handle = Some(
-                self.editor
-                    .lock()
-                    .spawn(parent_handle, self.inner.clone().make_gui_context()),
+            let spawend = self.editor.lock().spawn(
+                parent_handle,
+                self.daw,
+                self.inner.clone().make_gui_context(),
             );
+            *editor_handle = Some(spawend);
             *self.inner.plug_view.write() = Some(ObjectPtr::from(self));
 
             kResultOk
@@ -342,20 +352,46 @@ impl<P: Vst3Plugin> IPlugView for WrapperView<P> {
 
     unsafe fn on_key_down(
         &self,
-        _key: vst3_sys::base::char16,
-        _key_code: i16,
-        _modifiers: i16,
+        key: vst3_sys::base::char16,
+        key_code: i16,
+        modifiers: i16,
     ) -> tresult {
-        kResultOk
+        nih_log!(
+            "on_key_down k {:?} key_code {:?} modi {:?}",
+            key,
+            key_code,
+            modifiers
+        );
+        self.editor_handle
+            .read()
+            .as_ref()
+            .map(|e| match e.on_key_down(key, modifiers, key_code) {
+                true => kResultTrue,
+                false => kResultFalse,
+            })
+            .unwrap_or(kResultFalse)
     }
 
     unsafe fn on_key_up(
         &self,
-        _key: vst3_sys::base::char16,
-        _key_code: i16,
-        _modifiers: i16,
+        key: vst3_sys::base::char16,
+        key_code: i16,
+        modifiers: i16,
     ) -> tresult {
-        kResultOk
+        nih_log!(
+            "on_key_upup k {:?} key_code {:?} modi {:?}",
+            key,
+            key_code,
+            modifiers
+        );
+        self.editor_handle
+            .read()
+            .as_ref()
+            .map(|e| match e.on_key_up(key, modifiers, key_code) {
+                true => kResultTrue,
+                false => kResultFalse,
+            })
+            .unwrap_or(kResultFalse)
     }
 
     unsafe fn get_size(&self, size: *mut ViewRect) -> tresult {

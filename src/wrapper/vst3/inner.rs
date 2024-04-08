@@ -15,6 +15,7 @@ use super::param_units::ParamUnits;
 use super::util::{ObjectPtr, VstPtr, VST3_MIDI_PARAMS_END, VST3_MIDI_PARAMS_START};
 use super::view::WrapperView;
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
+use crate::plugin::Daw;
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, BufferConfig, Editor, MidiConfig, ParamFlags, ParamPtr, Params,
     Plugin, PluginNoteEvent, ProcessMode, ProcessStatus, TaskExecutor, Transport, Vst3Plugin,
@@ -28,6 +29,8 @@ use crate::wrapper::util::{hash_param_id, process_wrapper};
 /// Since we can't combine that with VST3's interior reference counting this just has to be moved to
 /// its own struct.
 pub(crate) struct WrapperInner<P: Vst3Plugin> {
+    pub daw: AtomicCell<Daw>,
+
     /// The wrapped plugin instance.
     pub plugin: Mutex<P>,
     /// The plugin's background task executor closure.
@@ -138,6 +141,18 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// untyped).
     pub param_ptr_to_hash: HashMap<ParamPtr, u32>,
 }
+
+/* impl<P: Vst3Plugin> WrapperInner<P> {
+    pub fn on_track_name(&self, track_name: String) {
+        self.plugin.lock().on_track_name(track_name);
+    }
+    pub fn on_track_index(&self, track_index: u32) {
+        self.plugin.lock().on_track_index(track_index);
+    }
+    pub fn on_track_color(&self, r: u8, g: u8, b: u8, alpha: u8) {
+        self.plugin.lock().on_track_color(r, g, b, alpha);
+    }
+} */
 
 /// Tasks that can be sent from the plugin to be executed on the main thread in a non-blocking
 /// realtime-safe way (either a random thread or `IRunLoop` on Linux, the OS' message loop on
@@ -275,6 +290,7 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             .collect();
 
         let wrapper = Arc::new(Self {
+            daw: AtomicCell::new(Daw::Other),
             plugin: Mutex::new(plugin),
             task_executor,
             params,

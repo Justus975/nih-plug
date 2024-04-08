@@ -1,7 +1,14 @@
 //! Traits and structs describing plugins and editors. This includes extension structs for features
 //! that are specific to one or more plugin-APIs.
 
-use std::sync::Arc;
+use core::fmt;
+use std::{error::Error, sync::Arc};
+
+use vst3_sys::{
+    base::tresult,
+    vst::{IComponentHandler, ParamID, TChar},
+    VstPtr,
+};
 
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, Buffer, BufferConfig, Editor, InitContext,
@@ -133,6 +140,9 @@ pub trait Plugin: Default + Send + 'static {
     // NOTE: Sadly it's not yet possible to default this and the `async_executor()` function to
     //       `()`: https://github.com/rust-lang/rust/issues/29661
     type BackgroundTask: Send;
+
+    type MyNihExtention: MyNihExtention;
+
     /// A function that executes the plugin's tasks. When implementing this you will likely want to
     /// pattern match on the task type, and then send any resulting data back over a channel or
     /// triple buffer. See [`BackgroundTask`][Self::BackgroundTask].
@@ -243,6 +253,8 @@ pub trait Plugin: Default + Send + 'static {
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus;
 
+    fn on_process_param_change(&mut self, param_id: ParamID, value: f32);
+
     /// Called when the plugin is deactivated. The host will call
     /// [`initialize()`][Self::initialize()] again before the plugin resumes processing audio. These
     /// two functions will not be called when the host only temporarily stops processing audio. You
@@ -252,6 +264,12 @@ pub trait Plugin: Default + Send + 'static {
     /// `initialize()` may be called more than once before `deactivate()` is called, for instance
     /// when restoring state while the plugin is still activate.
     fn deactivate(&mut self) {}
+
+    // TODO in future also write outputParameterChanges
+    /* fn recv_param_change(&mut self) -> Option<(ParamID, f32)> {
+        None
+    } */
+    fn get_my_nih_extention(&mut self) -> Self::MyNihExtention;
 }
 
 /// Indicates the current situation after the plugin has processed audio.
@@ -268,4 +286,79 @@ pub enum ProcessStatus {
     /// and should thus not be deactivated by the host. This is essentially the same as having an
     /// infinite tail.
     KeepAlive,
+}
+
+pub struct ParamEditingHandler {
+    component_handler: VstPtr<dyn IComponentHandler>,
+}
+
+impl ParamEditingHandler {
+    pub fn new(component_handler: VstPtr<dyn IComponentHandler>) -> Self {
+        Self { component_handler }
+    }
+
+    pub fn begin_edit(&self, index: ParamID) {
+        unsafe {
+            self.component_handler.begin_edit(index);
+        }
+    }
+    pub fn perform_edit(&self, index: ParamID, value: f64) {
+        unsafe {
+            self.component_handler.perform_edit(index, value);
+        }
+    }
+    pub fn end_edit(&self, index: ParamID) {
+        unsafe {
+            self.component_handler.end_edit(index);
+        }
+    }
+}
+
+unsafe impl Send for ParamEditingHandler {}
+unsafe impl Sync for ParamEditingHandler {}
+
+#[derive(Debug)]
+pub struct SetStateError {}
+
+impl fmt::Display for SetStateError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Invalid state")
+    }
+}
+
+impl std::error::Error for SetStateError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Daw {
+    Reaper,
+    Other,
+}
+
+pub trait MyNihExtention {
+    fn on_track_name(&self, track_name: String);
+    fn on_track_color(&self, r: u8, g: u8, b: u8, alpha: u8);
+    fn on_track_index(&self, track_index: u32);
+    // fn on_daw(&self, daw: Daw);
+
+    fn set_param_edit_handler(&self, handler: ParamEditingHandler);
+
+    // fn on_host_param_change(&self, param_id: ParamID, value: f32);
+    fn get_param_string_by_value(
+        &self,
+        id: u32,
+        value_normalized: f64,
+        string: *mut TChar,
+    ) -> tresult;
+    fn get_param_value_by_string(
+        &self,
+        id: u32,
+        string: *const TChar,
+        value_normalized: *mut f64,
+    ) -> tresult;
+    fn normalized_param_to_plain(&self, id: u32, value_normalized: f64) -> f64;
+    fn plain_param_to_normalized(&self, id: u32, plain_value: f64) -> f64;
+    fn get_param_normalized(&self, id: u32) -> f64;
+    fn set_param_normalized(&self, id: u32, value: f64) -> tresult;
+    fn get_state(&self) -> Option<Vec<u8>>;
+    fn set_state(&self, state: &Vec<u8>) -> Result<(), SetStateError>;
 }

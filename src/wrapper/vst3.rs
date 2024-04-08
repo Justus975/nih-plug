@@ -1,5 +1,5 @@
 #[macro_use]
-mod util;
+pub mod util;
 
 mod context;
 mod factory;
