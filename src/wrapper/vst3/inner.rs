@@ -621,6 +621,10 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     }
 }
 
+//TODO
+// unsafe impl<P: Vst3Plugin> Send for WrapperInner<P> {}
+// unsafe impl<P: Vst3Plugin> Sync for WrapperInner<P> {}
+
 impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
     fn execute(&self, task: Task<P>, is_gui_thread: bool) {
         // This function is always called from the main thread

@@ -8,6 +8,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use vst3_com::base::CStringA;
 use vst3_com::com_interface;
 use vst3_com::interfaces::IUnknown;
@@ -29,7 +30,9 @@ use vst3_sys::vst::{
 };
 use vst3_sys::VST3;
 use widestring::U16CStr;
-use windows::Win32::Foundation::FWP_E_NULL_DISPLAY_NAME;
+use windows::Win32::Foundation::{
+    ERROR_GRAPHICS_INVALID_VIDPN_TOPOLOGY_RECOMMENDATION_REASON, FWP_E_NULL_DISPLAY_NAME,
+};
 
 use super::inner::{ProcessEvent, WrapperInner};
 use super::note_expressions::{self, NoteExpressionController};
@@ -534,10 +537,37 @@ impl<P: Vst3Plugin> IComponent for Wrapper<P> {
             return kResultFalse;
         }
 
-        match self.ext.set_state(&read_buffer) {
+        let res = match self.ext.set_state(&read_buffer) {
             Ok(()) => kResultOk,
             Err(_) => kResultFalse,
-        }
+        };
+        res
+
+        //TODO so gehts
+        // self.inner
+        //     .param_by_hash
+        //     .values()
+        //     .skip(10)
+        //     .next()
+        //     .unwrap()
+        //     .set_normalized_value(0.9);
+
+        // let binding = self.inner.component_handler.borrow();
+        // let vst_ptr = binding.as_ref().unwrap();
+
+        //TODO das functioniert in bitwig
+        // let id = self.inner.param_hashes[5];
+        // self.set_param_normalized(id, 0.8);
+
+        // vst_ptr.begin_edit(5);
+        // vst_ptr.perform_edit(id, 0.8);
+        // vst_ptr.end_edit(id);
+
+        // vst_ptr.restart_component(1 << 2);
+
+        // self.inner.params.param_map()
+        // res
+        // kResultOk
     }
 
     unsafe fn get_state(&self, state: SharedVstPtr<dyn IBStream>) -> tresult {

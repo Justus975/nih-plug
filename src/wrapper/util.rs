@@ -1,7 +1,9 @@
+use anyhow::{anyhow, Context};
 use backtrace::Backtrace;
 use std::cmp;
 use std::marker::PhantomData;
 use std::os::raw::c_char;
+use std::path::PathBuf;
 
 use crate::util::permit_alloc;
 
@@ -102,6 +104,20 @@ pub fn clamp_output_event_timing(timing: u32, total_buffer_len: u32) -> u32 {
 /// - A file path, in which case the output gets appended to the end of that file which will be
 ///   created if necessary.
 pub fn setup_logger() {
+    pub fn config_dir() -> anyhow::Result<PathBuf> {
+        use dirs;
+        // Get the appropriate directory for the current platform
+
+        let mut config_dir: PathBuf = dirs::config_dir().ok_or(anyhow!("No os config dir"))?;
+        // Append the specific folder and file name
+        config_dir.push(env!("COMPANY_NAME"));
+        config_dir.push(env!("PRODUCT_NAME"));
+
+        std::fs::create_dir_all(&config_dir).context("Faild to create config dirs")?;
+
+        Ok(config_dir)
+    }
+
     let log_level = if cfg!(debug_assertions) {
         log::LevelFilter::Trace
     } else {
@@ -118,10 +134,11 @@ pub fn setup_logger() {
     #[cfg(debug_assertions)]
     let logger_builder = logger_builder.always_show_module_path();
 
+    let join = config_dir()
+        .unwrap()
+        .join(concat!(env!("PRODUCT_NAME"), ".log"));
     let logger_builder = logger_builder
-        .with_output_target(nih_log::OutputTarget::File(
-            r"C:\Users\justu\Desktop\nihlog.txt".into(),
-        ))
+        .with_output_target(nih_log::OutputTarget::File(join))
         .unwrap();
 
     // In release builds there are some more logging messages from libraries that are not relevant

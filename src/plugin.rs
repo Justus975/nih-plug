@@ -289,7 +289,7 @@ pub enum ProcessStatus {
 }
 
 pub struct ParamEditingHandler {
-    component_handler: VstPtr<dyn IComponentHandler>,
+    pub component_handler: VstPtr<dyn IComponentHandler>,
 }
 
 impl ParamEditingHandler {
